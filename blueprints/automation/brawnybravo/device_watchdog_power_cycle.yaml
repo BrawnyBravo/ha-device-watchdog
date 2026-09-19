@@ -1,0 +1,175 @@
+blueprint:
+  name: Device watchdog - power cycle an unresponsive device
+  description: >
+    Watches an entity and, if it stays unavailable (or unknown) for longer than a
+    configured grace period, power-cycles the device through a smart plug or relay:
+    the switch is turned off, held off briefly, then turned back on.
+
+    A rate limit keeps a flapping device from being cycled endlessly, and an
+    optional notification action lets you be told whenever a cycle happens.
+
+    Typical use: a display, media player, camera or sensor hub that occasionally
+    hangs and only comes back after its power is interrupted.
+  domain: automation
+  source_url: https://github.com/BrawnyBravo/ha-device-watchdog/blob/main/blueprints/automation/brawnybravo/device_watchdog_power_cycle.yaml
+  input:
+    watched_entity:
+      name: Entity to watch
+      description: >
+        The entity that shows whether the device is alive. Pick something that goes
+        to "unavailable" when the device drops off - for example a media player, a
+        sensor it publishes, or a ping binary sensor.
+      selector:
+        entity: {}
+    power_switch:
+      name: Power switch
+      description: >
+        The switch that supplies power to the device - usually a smart plug or an
+        in-wall relay. It must be a separate device from the one being watched,
+        otherwise the automation cannot turn it back on.
+      selector:
+        entity:
+          domain: switch
+    unavailable_for:
+      name: Unavailable for
+      description: >
+        How long the watched entity must stay unavailable/unknown before the
+        automation acts. Keep this comfortably longer than the device's normal
+        reboot, update or Wi-Fi reconnect time.
+      default:
+        hours: 0
+        minutes: 10
+        seconds: 0
+      selector:
+        duration: {}
+    power_off_duration:
+      name: Power off for
+      description: >
+        How long power stays cut before it is restored. Ten to thirty seconds is
+        usually enough to fully discharge a small device.
+      default:
+        hours: 0
+        minutes: 0
+        seconds: 15
+      selector:
+        duration: {}
+    recovery_grace:
+      name: Recovery grace period
+      description: >
+        How long to wait after power returns before treating the device as
+        recovered. This also blocks the automation from starting a second cycle
+        while the device is still booting.
+      default:
+        hours: 0
+        minutes: 3
+        seconds: 0
+      selector:
+        duration: {}
+    max_cycles:
+      name: Maximum power cycles per window
+      description: >
+        The most power cycles allowed inside the cooldown window below. Raising
+        this shortens the minimum spacing between cycles. See the README for how
+        this approximation works.
+      default: 3
+      selector:
+        number:
+          min: 1
+          max: 10
+          step: 1
+          mode: slider
+    cooldown_window:
+      name: Cooldown window
+      description: >
+        The rolling window the cycle limit applies to. With the default of one hour
+        and three cycles, a new cycle is allowed only if the last one was more than
+        twenty minutes ago.
+      default:
+        hours: 1
+        minutes: 0
+        seconds: 0
+      selector:
+        duration: {}
+    notify_action:
+      name: Notification action (optional)
+      description: >
+        Actions to run after power has been restored - send a notification, write
+        to the logbook, flash a light, or nothing at all. Leave empty to stay quiet.
+      default: []
+      selector:
+        action: {}
+
+# "single" plus the wait steps below means one cycle must finish, including the
+# recovery grace period, before another can begin.
+mode: single
+max_exceeded: silent
+
+variables:
+  watched_entity: !input watched_entity
+  max_cycles: !input max_cycles
+  cooldown_window: !input cooldown_window
+  # Duration selectors hand back a mapping, so flatten it to seconds for the
+  # cooldown maths below.
+  cooldown_seconds: >-
+    {{ (cooldown_window.days | default(0) | int) * 86400
+     + (cooldown_window.hours | default(0) | int) * 3600
+     + (cooldown_window.minutes | default(0) | int) * 60
+     + (cooldown_window.seconds | default(0) | int) }}
+  # Minimum spacing between cycles that keeps the count inside the window at or
+  # below the configured maximum.
+  min_gap_seconds: >-
+    {{ (cooldown_seconds | float(0)) / (max_cycles | float(1)) }}
+
+triggers:
+  - trigger: state
+    entity_id: !input watched_entity
+    to:
+      - unavailable
+      - unknown
+    for: !input unavailable_for
+
+conditions:
+  # Re-check the live state: the entity may have recovered between the trigger
+  # firing and this automation getting its turn to run.
+  - condition: template
+    value_template: >-
+      {{ states(watched_entity) in ['unavailable', 'unknown'] }}
+  # Rate limit / cooldown.
+  #
+  # A blueprint has no storage of its own - there is no counter it can keep
+  # between runs, and creating a helper entity is not something a blueprint can
+  # do. The one piece of history Home Assistant hands an automation about itself
+  # is `this.attributes.last_triggered`, the timestamp of the previous run.
+  #
+  # So instead of counting cycles, we enforce the minimum spacing that produces
+  # at most `max_cycles` runs inside `cooldown_window`. It is an approximation:
+  # it caps the long-run rate rather than the exact count in any given window,
+  # and `last_triggered` is cleared if the automation is reloaded, renamed or
+  # Home Assistant restarts - after which one extra cycle may slip through.
+  - condition: template
+    value_template: >-
+      {{ this.attributes.last_triggered is none
+         or (now() - this.attributes.last_triggered).total_seconds()
+            > (min_gap_seconds | float(0)) }}
+
+actions:
+  - alias: Cut power
+    action: switch.turn_off
+    target:
+      entity_id: !input power_switch
+
+  - alias: Hold power off
+    delay: !input power_off_duration
+
+  - alias: Restore power
+    action: switch.turn_on
+    target:
+      entity_id: !input power_switch
+
+  - alias: Wait for the device to come back
+    delay: !input recovery_grace
+
+  - alias: Optional notification
+    choose:
+      - conditions: []
+        sequence: !input notify_action
