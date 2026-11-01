@@ -202,12 +202,17 @@ variables:
   min_gap_seconds: >-
     {{ (cooldown_seconds | float(0)) / (max_cycles | float(1)) }}
 
+trigger_variables:
+  watched_trigger: !input watched_entity
+
+# A template trigger rather than a state trigger: it stays true (and its timer
+# keeps running) while the entity flips between unavailable and unknown, and
+# its from_state stays the last real state ("cleaning", say) that the busy
+# guard reads. A state trigger restarts on that flip and loses the real state.
 triggers:
-  - trigger: state
-    entity_id: !input watched_entity
-    to:
-      - unavailable
-      - unknown
+  - trigger: template
+    value_template: >-
+      {{ states(watched_trigger) in ['unavailable', 'unknown'] }}
     for: !input unavailable_for
 
 conditions:

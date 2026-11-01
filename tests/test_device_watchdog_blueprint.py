@@ -181,6 +181,31 @@ async def test_no_power_cut_when_last_seen_mid_cycle(hass: HomeAssistant, freeze
     assert [c.data["outcome"] for c in other] == ["skipped_busy"]
 
 
+async def test_busy_state_survives_an_unavailable_to_unknown_flip(hass: HomeAssistant, freezer):
+    """cleaning -> unavailable -> unknown must still be treated as mid-cycle."""
+    turn_off, _turn_on = await _setup(hass, watched_state="cleaning")
+
+    hass.states.async_set(WATCHED, STATE_UNAVAILABLE)
+    await _advance(hass, freezer, minutes=2)
+    hass.states.async_set(WATCHED, "unknown")
+    await _advance(hass, freezer, minutes=6)
+    await _advance(hass, freezer, minutes=6)
+
+    assert turn_off == []
+
+
+async def test_down_state_flip_does_not_restart_the_grace_period(hass: HomeAssistant, freezer):
+    """A display that flips unavailable -> unknown is still cycled on the first timer."""
+    turn_off, _turn_on = await _setup(hass)
+
+    hass.states.async_set(WATCHED, STATE_UNAVAILABLE)
+    await _advance(hass, freezer, minutes=3)
+    hass.states.async_set(WATCHED, "unknown")
+    await _advance(hass, freezer, minutes=3)
+
+    assert len(turn_off) == 1
+
+
 async def test_busy_match_ignores_case(hass: HomeAssistant, freezer):
     turn_off, _turn_on = await _setup(hass, watched_state="Cleaning")
     hass.states.async_set(WATCHED, STATE_UNAVAILABLE)
