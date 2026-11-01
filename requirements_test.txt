@@ -1,0 +1,2 @@
+# Test harness for the blueprint. It pulls in a matching Home Assistant.
+pytest-homeassistant-custom-component
