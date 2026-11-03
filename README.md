@@ -11,8 +11,14 @@ somebody unplugs it: a wall display, a media player, a camera, a small sensor hu
 
 1. The watched entity goes `unavailable` or `unknown` and stays there for the grace period.
 2. The automation checks the entity is still down, and that it has not cycled too recently.
-3. The power switch is turned off, held off, then turned back on.
-4. It waits out a recovery period, then runs your optional notification action.
+3. **Busy guard:** if the device was last seen mid-cycle (its last state before dropping out,
+   or an optional busy entity, is in the busy list - `cleaning`, `returning`, `cycling`,
+   `washing`, `drying`, `emptying`, `mowing` by default), power is left on and the run ends.
+4. **Gentler first step (optional):** your own actions run first - reload the device's
+   integration, refresh the entity, send a robot to its base. If the device comes back within
+   the wait, power is never cut. The busy guard is checked again afterwards.
+5. The power switch is turned off, held off, then turned back on.
+6. It waits out a recovery period, then runs your optional notification action.
 
 ## Inputs
 
@@ -25,7 +31,28 @@ somebody unplugs it: a wall display, a media player, a camera, a small sensor hu
 | Recovery grace period | How long to wait after power returns before calling it recovered. Default 3 minutes. |
 | Maximum power cycles per window | Cap on cycles inside the cooldown window. Default 3. |
 | Cooldown window | The rolling window the cap applies to. Default 1 hour. |
+| Never cut power if last seen in these states | The busy list. Matching ignores case. The defaults are not states a display or media player uses. |
+| Busy entities (optional) | Extra status entities checked against the busy list. One that is itself unavailable counts as not busy. |
+| Gentler first step (optional) | Actions tried before the power cut. If one fails, the run stops without cutting power. |
+| Wait after the gentler step | How long the gentler step gets to work. Default 2 minutes. |
+| Notification when power was NOT cut (optional) | Runs when the device was busy or the gentler step fixed it; `watchdog_outcome` is `skipped_busy` or `recovered_by_gentle_step`. |
 | Notification action (optional) | Anything you want run after the cycle. Empty by default. |
+
+### Robots and appliances
+
+Cutting power to a vacuum, litter box or washer mid-cycle can leave it jammed, wet or
+half-emptied. Point the blueprint at the device's own entity (its last state before it
+dropped out is what the busy guard reads), add a status sensor as a busy entity if the
+integration has one, and use a gentler first step such as:
+
+```yaml
+- action: homeassistant.reload_config_entry
+  target:
+    entity_id: vacuum.example_robot
+```
+
+A device that hangs while busy is never power-cycled by this blueprint; use the "power was
+NOT cut" notification so you hear about it.
 
 ## Installing a blueprint from a URL
 
@@ -68,6 +95,13 @@ reload automations.
   Then point the blueprint at that sensor - but note that the trigger looks for
   `unavailable`/`unknown`, not `off`, so use an `availability_template` (or a ping sensor,
   which reports unavailable when the host is unreachable) rather than a plain on/off state.
+- **The busy guard only knows what Home Assistant last saw.** If the device was mid-cycle but
+  had not reported it before it dropped out, or Home Assistant restarted while it was down
+  (no previous state), the guard cannot tell. Use a busy entity for anything where a
+  mid-cycle power cut would do damage.
+- **After a restart** a device that is already down gets the same grace period, then the
+  same checks. An entity that no longer exists is never treated as down. Litter boxes and
+  some robots report short status codes rather than words; add your device's busy states.
 - **No verification that the cycle worked.** The automation restores power and waits; it
   does not confirm recovery. The notification action is the place to report, and the cycle
   limit is what stops an unfixable device from being cycled all day.

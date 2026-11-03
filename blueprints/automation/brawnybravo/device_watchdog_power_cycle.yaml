@@ -10,6 +10,11 @@ blueprint:
 
     Typical use: a display, media player, camera or sensor hub that occasionally
     hangs and only comes back after its power is interrupted.
+
+    For robots and appliances (vacuums, litter boxes, anything with a cycle),
+    the "busy" guard refuses to cut power if the device was last seen mid-cycle,
+    and an optional gentler first step (reload, refresh, return to base) is
+    tried before the plug is touched.
   domain: automation
   source_url: https://github.com/BrawnyBravo/ha-device-watchdog/blob/main/blueprints/automation/brawnybravo/device_watchdog_power_cycle.yaml
   input:
@@ -90,6 +95,77 @@ blueprint:
         seconds: 0
       selector:
         duration: {}
+    busy_states:
+      name: Never cut power if last seen in these states
+      description: >
+        If the watched entity's last state before it went unavailable is one of
+        these, or a busy entity below is in one of them, power is not cut. This
+        stops a vacuum, litter box or other appliance being switched off in the
+        middle of a cycle. Matching ignores case. Add your device's own words:
+        a litter box's status sensor often uses short codes (check its states
+        in Developer tools), and you may want "paused" for a vacuum. The defaults are not states a
+        display or media player uses, so they change nothing for those.
+      default:
+        - cleaning
+        - returning
+        - cycling
+        - washing
+        - drying
+        - emptying
+        - mowing
+      selector:
+        select:
+          multiple: true
+          custom_value: true
+          options:
+            - cleaning
+            - returning
+            - cycling
+            - washing
+            - drying
+            - emptying
+            - mowing
+    busy_entities:
+      name: Busy entities (optional)
+      description: >
+        Extra entities that say whether the device is mid-cycle, for example a
+        status sensor. If any of them is in a busy state above, power is not cut.
+        An entity that is itself unavailable counts as not busy, since it usually
+        drops out together with the device.
+      default: []
+      selector:
+        entity:
+          multiple: true
+    gentle_action:
+      name: Gentler first step (optional)
+      description: >
+        Actions to try before cutting power - for example reload the device's
+        integration, refresh the entity, or send a robot back to its base. If
+        the watched entity comes back within the wait below, power is never cut.
+        If a step fails, the run stops without cutting power. Empty by default.
+      default: []
+      selector:
+        action: {}
+    gentle_wait:
+      name: Wait after the gentler step
+      description: >
+        How long to give the gentler step to bring the device back before
+        falling through to the power cycle.
+      default:
+        hours: 0
+        minutes: 2
+        seconds: 0
+      selector:
+        duration: {}
+    other_notify_action:
+      name: Notification when power was NOT cut (optional)
+      description: >
+        Actions to run when the run ends without a power cycle: the device was
+        busy, or the gentler step brought it back. The variable
+        `watchdog_outcome` is `skipped_busy` or `recovered_by_gentle_step`.
+      default: []
+      selector:
+        action: {}
     notify_action:
       name: Notification action (optional)
       description: >
@@ -106,6 +182,15 @@ max_exceeded: silent
 
 variables:
   watched_entity: !input watched_entity
+  busy_list: !input busy_states
+  busy_entities: !input busy_entities
+  gentle_steps: !input gentle_action
+  # The state the device was in just before it dropped out (the template
+  # trigger keeps the change that made it true). Empty after a restart, when
+  # only the busy entities can show the device is mid-cycle.
+  last_state: >-
+    {{ (trigger.from_state.state if trigger is defined and trigger.from_state is defined and trigger.from_state
+        else '') | lower }}
   max_cycles: !input max_cycles
   cooldown_window: !input cooldown_window
   # Duration selectors hand back a mapping, so flatten it to seconds for the
@@ -120,13 +205,25 @@ variables:
   min_gap_seconds: >-
     {{ (cooldown_seconds | float(0)) / (max_cycles | float(1)) }}
 
+trigger_variables:
+  watched_trigger: !input watched_entity
+
+# A template trigger rather than a state trigger: it stays true (and its timer
+# keeps running) while the entity flips between unavailable and unknown, and
+# its from_state stays the last real state ("cleaning", say) that the busy
+# guard reads. A state trigger restarts on that flip and loses the real state.
 triggers:
-  - trigger: state
-    entity_id: !input watched_entity
-    to:
-      - unavailable
-      - unknown
+  - trigger: template
+    value_template: >-
+      {{ states(watched_trigger) in ['unavailable', 'unknown'] }}
     for: !input unavailable_for
+  # A template trigger only arms once it has seen the device up, so a device
+  # that is already down when Home Assistant starts (hung after a power blip,
+  # say) would never be caught. The startup run waits out the same grace period
+  # in the actions below before doing anything.
+  - trigger: homeassistant
+    event: start
+    id: startup
 
 conditions:
   # Re-check the live state: the entity may have recovered between the trigger
@@ -153,6 +250,81 @@ conditions:
             > (min_gap_seconds | float(0)) }}
 
 actions:
+  - alias: After a restart, give the device the same grace period
+    if:
+      - condition: trigger
+        id: startup
+    then:
+      - wait_template: >-
+          {{ states(watched_entity) not in ['unavailable', 'unknown'] }}
+        timeout: !input unavailable_for
+        continue_on_timeout: true
+      # Carry on only if it is still down and the entity really exists (a
+      # removed entity reads as "unknown" too and must never cause a power
+      # cut). A plain condition here would only end this branch, so stop.
+      - if:
+          - condition: template
+            value_template: >-
+              {{ states[watched_entity] is none
+                 or states(watched_entity) not in ['unavailable', 'unknown'] }}
+        then:
+          - stop: Device came back after the restart, or does not exist.
+
+  - alias: Do not cut power mid-cycle
+    if:
+      - condition: template
+        value_template: &busy >-
+          {% set busy = busy_list | map('lower') | list %}
+          {% set ents = [busy_entities] if busy_entities is string
+                        else busy_entities %}
+          {% set ns = namespace(hit = last_state in busy) %}
+          {% for e in ents %}
+            {% if states(e) | lower in busy %}{% set ns.hit = true %}{% endif %}
+          {% endfor %}
+          {{ ns.hit }}
+    then:
+      - variables:
+          watchdog_outcome: skipped_busy
+      - choose:
+          - conditions: []
+            sequence: !input other_notify_action
+      - stop: Device was mid-cycle; power left on.
+
+  - alias: Gentler first step
+    if:
+      - condition: template
+        value_template: "{{ gentle_steps | length > 0 }}"
+    then:
+      - choose:
+          - conditions: []
+            sequence: !input gentle_action
+      - wait_template: >-
+          {{ states(watched_entity) not in ['unavailable', 'unknown'] }}
+        timeout: !input gentle_wait
+        continue_on_timeout: true
+      - if:
+          - condition: template
+            value_template: >-
+              {{ states(watched_entity) not in ['unavailable', 'unknown'] }}
+        then:
+          - variables:
+              watchdog_outcome: recovered_by_gentle_step
+          - choose:
+              - conditions: []
+                sequence: !input other_notify_action
+          - stop: Device came back after the gentler step.
+      # The gentler step may have woken a busy status entity; check again.
+      - if:
+          - condition: template
+            value_template: *busy
+        then:
+          - variables:
+              watchdog_outcome: skipped_busy
+          - choose:
+              - conditions: []
+                sequence: !input other_notify_action
+          - stop: Device was mid-cycle; power left on.
+
   - alias: Cut power
     action: switch.turn_off
     target:
