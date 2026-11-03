@@ -99,6 +99,9 @@ reload automations.
   had not reported it before it dropped out, or Home Assistant restarted while it was down
   (no previous state), the guard cannot tell. Use a busy entity for anything where a
   mid-cycle power cut would do damage.
+- **After a restart** a device that is already down gets the same grace period, then the
+  same checks. An entity that no longer exists is never treated as down. Litter boxes and
+  some robots report short status codes rather than words; add your device's busy states.
 - **No verification that the cycle worked.** The automation restores power and waits; it
   does not confirm recovery. The notification action is the place to report, and the cycle
   limit is what stops an unfixable device from being cycled all day.

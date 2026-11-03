@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 from homeassistant.components import automation
-from homeassistant.const import STATE_UNAVAILABLE
+from homeassistant.const import EVENT_HOMEASSISTANT_STARTED, STATE_UNAVAILABLE
 from homeassistant.core import HomeAssistant
 from homeassistant.setup import async_setup_component
 from homeassistant.util import dt as dt_util
@@ -31,13 +31,14 @@ POWER_OFF_FOR = {"seconds": 15}
 RECOVERY_GRACE = {"minutes": 2}
 
 
-async def _setup(hass: HomeAssistant, watched_state: str = "playing", **extra_inputs):
+async def _setup(hass: HomeAssistant, watched_state: str | None = "playing", **extra_inputs):
     """Install the blueprint and create one automation from it."""
     dest = Path(hass.config.path("blueprints/automation/brawnybravo"))
     dest.mkdir(parents=True, exist_ok=True)
     shutil.copy(BLUEPRINT, dest / BLUEPRINT.name)
 
-    hass.states.async_set(WATCHED, watched_state)
+    if watched_state is not None:
+        hass.states.async_set(WATCHED, watched_state)
     hass.states.async_set(PLUG, "on")
 
     turn_off = async_mock_service(hass, "switch", "turn_off")
@@ -305,4 +306,38 @@ async def test_busy_after_gentle_step_still_blocks(hass: HomeAssistant, freezer)
     await _advance(hass, freezer, minutes=3)
     await _advance(hass, freezer, minutes=1)
 
+    assert turn_off == []
+
+
+# --------------------------------------------------------------------------- restarts
+
+
+async def test_device_already_down_at_startup_is_cycled(hass: HomeAssistant, freezer):
+    """A device that comes up dead after a restart still gets its power cycle."""
+    turn_off, _turn_on = await _setup(hass, watched_state=None)
+    hass.states.async_set(WATCHED, STATE_UNAVAILABLE)  # late integration, already dead
+    hass.bus.async_fire(EVENT_HOMEASSISTANT_STARTED)
+    await _advance(hass, freezer, minutes=2)
+    assert turn_off == [], "must wait out the grace period after a restart"
+
+    await _advance(hass, freezer, minutes=4)
+    await _advance(hass, freezer, seconds=5)
+    assert len(turn_off) == 1
+
+
+async def test_device_that_recovers_after_startup_is_left_alone(hass: HomeAssistant, freezer):
+    turn_off, _turn_on = await _setup(hass, watched_state=STATE_UNAVAILABLE)
+    hass.bus.async_fire(EVENT_HOMEASSISTANT_STARTED)
+    await _advance(hass, freezer, minutes=2)
+    hass.states.async_set(WATCHED, "playing")
+    await _advance(hass, freezer, minutes=10)
+    assert turn_off == []
+
+
+async def test_missing_entity_at_startup_never_cuts_power(hass: HomeAssistant, freezer):
+    """A removed entity reads as unknown; that must not power-cycle anything."""
+    turn_off, _turn_on = await _setup(hass, watched_state=None)
+    hass.bus.async_fire(EVENT_HOMEASSISTANT_STARTED)
+    await _advance(hass, freezer, minutes=6)
+    await _advance(hass, freezer, minutes=6)
     assert turn_off == []

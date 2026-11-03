@@ -101,7 +101,9 @@ blueprint:
         If the watched entity's last state before it went unavailable is one of
         these, or a busy entity below is in one of them, power is not cut. This
         stops a vacuum, litter box or other appliance being switched off in the
-        middle of a cycle. Matching ignores case. The defaults are not states a
+        middle of a cycle. Matching ignores case. Add your device's own words:
+        a litter box's status sensor often uses short codes (check its states
+        in Developer tools), and you may want "paused" for a vacuum. The defaults are not states a
         display or media player uses, so they change nothing for those.
       default:
         - cleaning
@@ -183,10 +185,11 @@ variables:
   busy_list: !input busy_states
   busy_entities: !input busy_entities
   gentle_steps: !input gentle_action
-  # The state the device was in just before it dropped out. With a `for:` state
-  # trigger this is the state before the change, not "unavailable".
+  # The state the device was in just before it dropped out (the template
+  # trigger keeps the change that made it true). Empty after a restart, when
+  # only the busy entities can show the device is mid-cycle.
   last_state: >-
-    {{ (trigger.from_state.state if trigger is defined and trigger.from_state
+    {{ (trigger.from_state.state if trigger is defined and trigger.from_state is defined and trigger.from_state
         else '') | lower }}
   max_cycles: !input max_cycles
   cooldown_window: !input cooldown_window
@@ -214,6 +217,13 @@ triggers:
     value_template: >-
       {{ states(watched_trigger) in ['unavailable', 'unknown'] }}
     for: !input unavailable_for
+  # A template trigger only arms once it has seen the device up, so a device
+  # that is already down when Home Assistant starts (hung after a power blip,
+  # say) would never be caught. The startup run waits out the same grace period
+  # in the actions below before doing anything.
+  - trigger: homeassistant
+    event: start
+    id: startup
 
 conditions:
   # Re-check the live state: the entity may have recovered between the trigger
@@ -240,6 +250,26 @@ conditions:
             > (min_gap_seconds | float(0)) }}
 
 actions:
+  - alias: After a restart, give the device the same grace period
+    if:
+      - condition: trigger
+        id: startup
+    then:
+      - wait_template: >-
+          {{ states(watched_entity) not in ['unavailable', 'unknown'] }}
+        timeout: !input unavailable_for
+        continue_on_timeout: true
+      # Carry on only if it is still down and the entity really exists (a
+      # removed entity reads as "unknown" too and must never cause a power
+      # cut). A plain condition here would only end this branch, so stop.
+      - if:
+          - condition: template
+            value_template: >-
+              {{ states[watched_entity] is none
+                 or states(watched_entity) not in ['unavailable', 'unknown'] }}
+        then:
+          - stop: Device came back after the restart, or does not exist.
+
   - alias: Do not cut power mid-cycle
     if:
       - condition: template
